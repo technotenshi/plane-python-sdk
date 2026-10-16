@@ -23,7 +23,7 @@ class WorkItemDependencies(BaseResource):
     first and fall back to ``relations/`` only when the server answers 404 for it.
     Authentication errors, server errors and timeouts are never retried elsewhere. A 404
     on a write means the request was not applied, so the fallback cannot double-write.
-    ``remove`` is unchanged; whether CE supports removal is unverified (see ticket 06).
+    ``remove`` is unchanged and not adapted for CE; CE removal support is unverified.
     """
 
     def __init__(self, config: Any) -> None:
@@ -85,7 +85,10 @@ class WorkItemDependencies(BaseResource):
     def _ce_groups(
         groups: dict[str, builtins.list[dict[str, Any]]],
     ) -> dict[str, builtins.list[dict[str, Any]]]:
-        """Turn CE ``{project_id, issue_id}`` references into work item references."""
+        """Turn CE ``{project_id, issue_id}`` references into work item references.
+
+        ``issue_id`` is CE's wire key for the related work item's id.
+        """
         return {
             group: [
                 {"id": ref["issue_id"], "project_id": ref["project_id"], "relation_type": group}
@@ -113,9 +116,16 @@ class WorkItemDependencies(BaseResource):
                 f"{base}/relations/",
                 {"relation_type": data.relation_type, "issues": missing},
             )
-            # CE answers with the stored direction; report it from this work item's side,
-            # as the read does, so a retry and a first call agree.
-            created = [{**item, "relation_type": data.relation_type} for item in response]
+            # Report the same minimal reference the read gives, from this work item's side,
+            # so a first call and a retry return identical items.
+            created = [
+                {
+                    "id": item["id"],
+                    "project_id": item["project_id"],
+                    "relation_type": data.relation_type,
+                }
+                for item in response
+            ]
             # CE silently skips ids it does not know, so a short answer is a failed write.
             absent = [target for target in missing if target not in {c["id"] for c in created}]
             if absent:

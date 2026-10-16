@@ -29,6 +29,31 @@ BASE = f"/api/v1/workspaces/{WORKSPACE}/projects/{PROJECT}/work-items"
 GROUPS = ("blocking", "blocked_by", "start_before", "start_after", "finish_before", "finish_after")
 
 
+# CE stores one row per pair: the request type maps to (stored type, reversed?).
+ACTUAL = {
+    "blocking": ("blocked_by", True),
+    "blocked_by": ("blocked_by", False),
+    "start_after": ("start_before", True),
+    "start_before": ("start_before", False),
+    "finish_after": ("finish_before", True),
+    "finish_before": ("finish_before", False),
+}
+# Stored type -> (group seen by the second item, group seen by the first item).
+MIRROR = {
+    "blocked_by": ("blocking", "blocked_by"),
+    "start_before": ("start_after", "start_before"),
+    "finish_before": ("finish_after", "finish_before"),
+}
+OPPOSITE = {
+    "blocking": "blocked_by",
+    "blocked_by": "blocking",
+    "start_before": "start_after",
+    "start_after": "start_before",
+    "finish_before": "finish_after",
+    "finish_after": "finish_before",
+}
+
+
 class FakePlane:
     """Records requests and answers like CE (``relations/``) or modern (``dependencies/``)."""
 
@@ -66,22 +91,22 @@ class FakePlane:
         if method == "GET":
             groups: dict[str, list[dict[str, str]]] = {name: [] for name in GROUPS}
             groups.update(duplicate=[], relates_to=[])
-            for first, second, _ in self.rows:
+            for first, second, stored in self.rows:
+                after, before = MIRROR[stored]
                 if second == item:
-                    groups["blocking"].append({"project_id": PROJECT, "issue_id": first})
+                    groups[after].append({"project_id": PROJECT, "issue_id": first})
                 if first == item:
-                    groups["blocked_by"].append({"project_id": PROJECT, "issue_id": second})
+                    groups[before].append({"project_id": PROJECT, "issue_id": second})
             return 200, groups
         assert "work_item_ids" not in body, "CE takes `issues`"
-        reverse = body["relation_type"] == "blocking"
+        stored, reverse = ACTUAL[body["relation_type"]]
         created: list[dict[str, str]] = []
         for other in body["issues"]:
             if other in self.unknown:
                 continue
-            row = (other, item, "blocked_by") if reverse else (item, other, "blocked_by")
+            row = (other, item, stored) if reverse else (item, other, stored)
             if row not in self.rows:
                 self.rows.append(row)
-            stored = "blocked_by"  # CE reports the stored direction
             created.append({"id": other, "project_id": PROJECT, "relation_type": stored})
         return 201, created
 
@@ -260,7 +285,8 @@ def test_ce_retry_reports_the_same_relation_type_as_the_first_call(make_server: 
     first = _create(client, ITEM_A, "blocking", [ITEM_B])
     retry = _create(client, ITEM_A, "blocking", [ITEM_B])
 
-    assert [i.relation_type for i in first] == [i.relation_type for i in retry] == ["blocking"]
+    assert [i.model_dump() for i in first] == [i.model_dump() for i in retry]
+    assert [i.relation_type for i in first] == ["blocking"]
 
 
 def test_ce_create_fails_when_the_server_skips_a_target(make_server: Any) -> None:
@@ -306,3 +332,16 @@ def test_ce_leg_write_timeout_is_not_retried(make_server: Any) -> None:
 
     assert "imeout" in type(raised.value).__name__ or "imed out" in str(raised.value)
     assert len(fake.relation_posts()) == 1
+
+
+@pytest.mark.parametrize("relation_type", GROUPS)
+def test_every_dependency_type_round_trips_with_its_mirror_on_the_other_item(
+    make_server: Any, relation_type: str
+) -> None:
+    _, client = make_server("ce")
+
+    created = _create(client, ITEM_A, relation_type, [ITEM_B])
+
+    assert [(i.id, i.relation_type) for i in created] == [(ITEM_B, relation_type)]
+    assert [i.id for i in getattr(_list(client, ITEM_A), relation_type)] == [ITEM_B]
+    assert [i.id for i in getattr(_list(client, ITEM_B), OPPOSITE[relation_type])] == [ITEM_A]
