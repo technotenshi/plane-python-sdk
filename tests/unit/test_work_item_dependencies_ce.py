@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from plane.client import PlaneClient
-from plane.errors.errors import HttpError
+from plane.errors.errors import HttpError, PlaneError
 from plane.models.work_items import CreateWorkItemDependency
 
 WORKSPACE = "ws"
@@ -40,6 +40,8 @@ class FakePlane:
         # Route -> forced status for a method, e.g. {("dependencies", "POST"): 500}.
         self.forced: dict[tuple[str, str], int] = {}
         self.delay: dict[tuple[str, str], float] = {}
+        # Ids CE would skip because it does not know them.
+        self.unknown: set[str] = set()
 
     def relation_posts(self) -> list[Any]:
         return [b for m, path, b in self.requests if m == "POST" and path.endswith("/relations/")]
@@ -72,12 +74,15 @@ class FakePlane:
             return 200, groups
         assert "work_item_ids" not in body, "CE takes `issues`"
         reverse = body["relation_type"] == "blocking"
-        created = []
+        created: list[dict[str, str]] = []
         for other in body["issues"]:
+            if other in self.unknown:
+                continue
             row = (other, item, "blocked_by") if reverse else (item, other, "blocked_by")
             if row not in self.rows:
                 self.rows.append(row)
-            created.append({"id": other, "project_id": PROJECT, "relation_type": "blocked_by"})
+            stored = "blocked_by"  # CE reports the stored direction
+            created.append({"id": other, "project_id": PROJECT, "relation_type": stored})
         return 201, created
 
     def _modern(self, method: str, item: str, body: Any) -> tuple[int, Any]:
@@ -247,3 +252,57 @@ def test_a_404_from_both_routes_raises_the_original_error(make_server: Any) -> N
 
     assert raised.value.status_code == 404
     assert [route for _, route in fake.paths()] == ["dependencies", "relations"]
+
+
+def test_ce_retry_reports_the_same_relation_type_as_the_first_call(make_server: Any) -> None:
+    _, client = make_server("ce")
+
+    first = _create(client, ITEM_A, "blocking", [ITEM_B])
+    retry = _create(client, ITEM_A, "blocking", [ITEM_B])
+
+    assert [i.relation_type for i in first] == [i.relation_type for i in retry] == ["blocking"]
+
+
+def test_ce_create_fails_when_the_server_skips_a_target(make_server: Any) -> None:
+    fake, client = make_server("ce")
+    fake.unknown.add(ITEM_C)
+
+    with pytest.raises(PlaneError, match=ITEM_C):
+        _create(client, ITEM_A, "blocking", [ITEM_B, ITEM_C])
+
+    assert fake.rows == [(ITEM_B, ITEM_A, "blocked_by")]
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_ce_leg_read_errors_before_a_create_post_nothing(make_server: Any, status: int) -> None:
+    fake, client = make_server("ce")
+    fake.forced[("relations", "GET")] = status
+
+    with pytest.raises(HttpError) as raised:
+        _create(client, ITEM_A, "blocking", [ITEM_B])
+
+    assert raised.value.status_code == status
+    assert fake.relation_posts() == []
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_ce_leg_write_errors_are_raised_not_retried(make_server: Any, status: int) -> None:
+    fake, client = make_server("ce")
+    fake.forced[("relations", "POST")] = status
+
+    with pytest.raises(HttpError) as raised:
+        _create(client, ITEM_A, "blocking", [ITEM_B])
+
+    assert raised.value.status_code == status
+    assert len(fake.relation_posts()) == 1
+
+
+def test_ce_leg_write_timeout_is_not_retried(make_server: Any) -> None:
+    fake, client = make_server("ce")
+    fake.delay[("relations", "POST")] = 1.5
+
+    with pytest.raises(Exception) as raised:
+        _create(client, ITEM_A, "blocking", [ITEM_B])
+
+    assert "imeout" in type(raised.value).__name__ or "imed out" in str(raised.value)
+    assert len(fake.relation_posts()) == 1

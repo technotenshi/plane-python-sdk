@@ -3,7 +3,7 @@ from __future__ import annotations
 import builtins
 from typing import Any
 
-from ...errors.errors import HttpError
+from ...errors.errors import HttpError, PlaneError
 from ...models.work_items import (
     CreateWorkItemDependency,
     WorkItemDependencyResponse,
@@ -23,7 +23,7 @@ class WorkItemDependencies(BaseResource):
     first and fall back to ``relations/`` only when the server answers 404 for it.
     Authentication errors, server errors and timeouts are never retried elsewhere. A 404
     on a write means the request was not applied, so the fallback cannot double-write.
-    ``remove`` has no CE equivalent and is unchanged.
+    ``remove`` is unchanged; whether CE supports removal is unverified (see ticket 06).
     """
 
     def __init__(self, config: Any) -> None:
@@ -102,15 +102,26 @@ class WorkItemDependencies(BaseResource):
         Reading first makes a retry after an uncertain outcome (for example a timeout)
         safe: relations that landed are returned, not created a second time.
         """
-        existing = self._ce_groups(self._get_fallback(base, original))[data.relation_type]
+        groups = self._ce_groups(self._get_fallback(base, original))
+        existing = groups.get(data.relation_type, [])
         present = {ref["id"] for ref in existing}
         missing = [target for target in data.work_item_ids if target not in present]
         created: builtins.list[dict[str, Any]] = []
         if missing:
-            created = self._post(
+            # `issues` is the CE wire key for the target work item ids.
+            response = self._post(
                 f"{base}/relations/",
                 {"relation_type": data.relation_type, "issues": missing},
             )
+            # CE answers with the stored direction; report it from this work item's side,
+            # as the read does, so a retry and a first call agree.
+            created = [{**item, "relation_type": data.relation_type} for item in response]
+            # CE silently skips ids it does not know, so a short answer is a failed write.
+            absent = [target for target in missing if target not in {c["id"] for c in created}]
+            if absent:
+                raise PlaneError(
+                    f"{data.relation_type} relation not created for work items: {absent}"
+                )
         wanted = set(data.work_item_ids)
         return [ref for ref in existing if ref["id"] in wanted] + created
 
