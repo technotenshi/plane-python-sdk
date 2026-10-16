@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import uuid
 from typing import Any
 
 from ...errors.errors import HttpError, PlaneError
@@ -45,7 +46,9 @@ class WorkItemDependencies(BaseResource):
         except HttpError as error:
             if error.status_code != 404:
                 raise
-            response = self._ce_groups(self._get_fallback(base, error))
+            response = self._ce_groups(
+                self._fallback(error, lambda: self._get(f"{base}/relations/"))
+            )
         return WorkItemDependencyResponse.model_validate(response)
 
     def create(
@@ -72,14 +75,23 @@ class WorkItemDependencies(BaseResource):
             response = self._create_via_relations(base, data, error)
         return [WorkItemWithRelationType.model_validate(item) for item in response]
 
-    def _get_fallback(self, base: str, original: HttpError) -> Any:
-        """Read CE ``relations/``; a 404 there too means the original error stands."""
+    @staticmethod
+    def _fallback(original: HttpError, call: Any) -> Any:
+        """Run a CE ``relations/`` call; a 404 there too means the original error stands."""
         try:
-            return self._get(f"{base}/relations/")
+            return call()
         except HttpError as error:
             if error.status_code == 404:
                 raise original from error
             raise
+
+    @staticmethod
+    def _canonical_id(value: str) -> str:
+        """CE stores and returns lowercase hyphenated UUIDs whatever spelling it was sent."""
+        try:
+            return str(uuid.UUID(value))
+        except ValueError:
+            return value
 
     @staticmethod
     def _ce_groups(
@@ -105,17 +117,16 @@ class WorkItemDependencies(BaseResource):
         Reading first makes a retry after an uncertain outcome (for example a timeout)
         safe: relations that landed are returned, not created a second time.
         """
-        groups = self._ce_groups(self._get_fallback(base, original))
+        groups = self._ce_groups(self._fallback(original, lambda: self._get(f"{base}/relations/")))
         existing = groups.get(data.relation_type, [])
         present = {ref["id"] for ref in existing}
-        missing = [target for target in data.work_item_ids if target not in present]
+        wanted = builtins.list(dict.fromkeys(self._canonical_id(t) for t in data.work_item_ids))
+        missing = [target for target in wanted if target not in present]
         created: builtins.list[dict[str, Any]] = []
         if missing:
             # `issues` is the CE wire key for the target work item ids.
-            response = self._post(
-                f"{base}/relations/",
-                {"relation_type": data.relation_type, "issues": missing},
-            )
+            payload = {"relation_type": data.relation_type, "issues": missing}
+            response = self._fallback(original, lambda: self._post(f"{base}/relations/", payload))
             # Report the same minimal reference the read gives, from this work item's side,
             # so a first call and a retry return identical items.
             created = [
@@ -127,13 +138,13 @@ class WorkItemDependencies(BaseResource):
                 for item in response
             ]
             # CE silently skips ids it does not know, so a short answer is a failed write.
-            absent = [target for target in missing if target not in {c["id"] for c in created}]
+            landed = {c["id"] for c in created}
+            absent = [target for target in missing if target not in landed]
             if absent:
                 raise PlaneError(
                     f"{data.relation_type} relation not created for work items: {absent}"
                 )
-        wanted = set(data.work_item_ids)
-        return [ref for ref in existing if ref["id"] in wanted] + created
+        return [ref for ref in existing if ref["id"] in set(wanted)] + created
 
     def remove(
         self,

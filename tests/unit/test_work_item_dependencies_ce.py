@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -79,7 +80,7 @@ class FakePlane:
         item, route = path.removeprefix(BASE + "/").strip("/").split("/")
         time.sleep(self.delay.get((route, method), 0))
         if (route, method) in self.forced:
-            return self.forced[(route, method)], {"detail": "forced"}
+            return self.forced[(route, method)], {"detail": f"{route}-{method}-forced"}
         live = "relations" if self.flavour == "ce" else "dependencies"
         if route != live:
             return 404, {"error": "not found"}
@@ -101,7 +102,9 @@ class FakePlane:
         assert "work_item_ids" not in body, "CE takes `issues`"
         stored, reverse = ACTUAL[body["relation_type"]]
         created: list[dict[str, str]] = []
-        for other in body["issues"]:
+        for given in body["issues"]:
+            # CE accepts any UUID spelling and stores and returns the canonical one.
+            other = str(uuid.UUID(given))
             if other in self.unknown:
                 continue
             row = (other, item, stored) if reverse else (item, other, stored)
@@ -345,3 +348,55 @@ def test_every_dependency_type_round_trips_with_its_mirror_on_the_other_item(
     assert [(i.id, i.relation_type) for i in created] == [(ITEM_B, relation_type)]
     assert [i.id for i in getattr(_list(client, ITEM_A), relation_type)] == [ITEM_B]
     assert [i.id for i in getattr(_list(client, ITEM_B), OPPOSITE[relation_type])] == [ITEM_A]
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [ITEM_B.upper(), ITEM_B.replace("-", ""), ITEM_B.upper().replace("-", "")],
+    ids=["uppercase", "hyphenless", "both"],
+)
+def test_ce_create_accepts_any_uuid_spelling_and_a_retry_does_not_post_again(
+    make_server: Any, spelling: str
+) -> None:
+    fake, client = make_server("ce")
+
+    first = _create(client, ITEM_A, "blocking", [spelling])
+    retry = _create(client, ITEM_A, "blocking", [spelling])
+
+    assert [i.id for i in first] == [i.id for i in retry] == [ITEM_B]
+    assert len(fake.relation_posts()) == 1
+    assert fake.rows == [(ITEM_B, ITEM_A, "blocked_by")]
+
+
+def test_ce_create_still_fails_for_a_skipped_target_given_in_another_spelling(
+    make_server: Any,
+) -> None:
+    fake, client = make_server("ce")
+    fake.unknown.add(ITEM_C)
+
+    with pytest.raises(PlaneError, match=ITEM_C):
+        _create(client, ITEM_A, "blocking", [ITEM_C.upper()])
+
+
+def test_ce_fallback_post_404_raises_the_original_dependencies_error(make_server: Any) -> None:
+    fake, client = make_server("ce")
+    fake.forced[("dependencies", "POST")] = 404
+    fake.forced[("relations", "POST")] = 404
+
+    with pytest.raises(HttpError) as raised:
+        _create(client, ITEM_A, "blocking", [ITEM_B])
+
+    assert raised.value.status_code == 404
+    assert raised.value.response == {"detail": "dependencies-POST-forced"}
+    assert fake.rows == []
+
+
+def test_ce_fallback_get_404_raises_the_original_dependencies_error(make_server: Any) -> None:
+    fake, client = make_server("ce")
+    fake.forced[("dependencies", "GET")] = 404
+    fake.forced[("relations", "GET")] = 404
+
+    with pytest.raises(HttpError) as raised:
+        _list(client, ITEM_A)
+
+    assert raised.value.response == {"detail": "dependencies-GET-forced"}
