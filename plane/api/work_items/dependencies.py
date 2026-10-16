@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import builtins
 from typing import Any
 
+from ...errors.errors import HttpError
 from ...models.work_items import (
     CreateWorkItemDependency,
     WorkItemDependencyResponse,
@@ -15,6 +17,13 @@ class WorkItemDependencies(BaseResource):
 
     Covers the six built-in dependency directions:
     blocking / blocked_by / start_before / start_after / finish_before / finish_after.
+
+    Community Edition has no ``dependencies/`` route; it serves ``relations/`` with a
+    different payload and response shape. ``list`` and ``create`` try ``dependencies/``
+    first and fall back to ``relations/`` only when the server answers 404 for it.
+    Authentication errors, server errors and timeouts are never retried elsewhere. A 404
+    on a write means the request was not applied, so the fallback cannot double-write.
+    ``remove`` has no CE equivalent and is unchanged.
     """
 
     def __init__(self, config: Any) -> None:
@@ -30,9 +39,13 @@ class WorkItemDependencies(BaseResource):
             project_id: UUID of the project
             work_item_id: UUID of the work item
         """
-        response = self._get(
-            f"{workspace_slug}/projects/{project_id}/work-items/{work_item_id}/dependencies/"
-        )
+        base = f"{workspace_slug}/projects/{project_id}/work-items/{work_item_id}"
+        try:
+            response = self._get(f"{base}/dependencies/")
+        except HttpError as error:
+            if error.status_code != 404:
+                raise
+            response = self._ce_groups(self._get_fallback(base, error))
         return WorkItemDependencyResponse.model_validate(response)
 
     def create(
@@ -41,7 +54,7 @@ class WorkItemDependencies(BaseResource):
         project_id: str,
         work_item_id: str,
         data: CreateWorkItemDependency,
-    ) -> list[WorkItemWithRelationType]:
+    ) -> builtins.list[WorkItemWithRelationType]:
         """Create one or more dependency relations for a work item.
 
         Args:
@@ -50,11 +63,56 @@ class WorkItemDependencies(BaseResource):
             work_item_id: UUID of the work item
             data: Dependency creation payload
         """
-        response = self._post(
-            f"{workspace_slug}/projects/{project_id}/work-items/{work_item_id}/dependencies/",
-            data.model_dump(exclude_none=True),
-        )
+        base = f"{workspace_slug}/projects/{project_id}/work-items/{work_item_id}"
+        try:
+            response = self._post(f"{base}/dependencies/", data.model_dump(exclude_none=True))
+        except HttpError as error:
+            if error.status_code != 404:
+                raise
+            response = self._create_via_relations(base, data, error)
         return [WorkItemWithRelationType.model_validate(item) for item in response]
+
+    def _get_fallback(self, base: str, original: HttpError) -> Any:
+        """Read CE ``relations/``; a 404 there too means the original error stands."""
+        try:
+            return self._get(f"{base}/relations/")
+        except HttpError as error:
+            if error.status_code == 404:
+                raise original from error
+            raise
+
+    @staticmethod
+    def _ce_groups(
+        groups: dict[str, builtins.list[dict[str, Any]]],
+    ) -> dict[str, builtins.list[dict[str, Any]]]:
+        """Turn CE ``{project_id, issue_id}`` references into work item references."""
+        return {
+            group: [
+                {"id": ref["issue_id"], "project_id": ref["project_id"], "relation_type": group}
+                for ref in refs
+            ]
+            for group, refs in groups.items()
+        }
+
+    def _create_via_relations(
+        self, base: str, data: CreateWorkItemDependency, original: HttpError
+    ) -> builtins.list[dict[str, Any]]:
+        """Create on CE ``relations/``, posting only targets not already related.
+
+        Reading first makes a retry after an uncertain outcome (for example a timeout)
+        safe: relations that landed are returned, not created a second time.
+        """
+        existing = self._ce_groups(self._get_fallback(base, original))[data.relation_type]
+        present = {ref["id"] for ref in existing}
+        missing = [target for target in data.work_item_ids if target not in present]
+        created: builtins.list[dict[str, Any]] = []
+        if missing:
+            created = self._post(
+                f"{base}/relations/",
+                {"relation_type": data.relation_type, "issues": missing},
+            )
+        wanted = set(data.work_item_ids)
+        return [ref for ref in existing if ref["id"] in wanted] + created
 
     def remove(
         self,
